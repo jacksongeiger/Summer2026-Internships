@@ -1,0 +1,110 @@
+name: Export postings to Google Sheet (manual)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch listings.json from your repo (dev)
+        run: |
+          curl -fsSL \
+            -o listings.json \
+            "https://raw.githubusercontent.com/jacksongeiger/Summer2026-Internships/dev/.github/scripts/listings.json"
+          test -s listings.json
+
+      - name: Build payload + POST to Google Sheets webhook
+        env:
+          SHEETS_WEBHOOK_URL: ${{ secrets.SHEETS_WEBHOOK_URL }}
+        run: |
+          python3 - << 'PY'
+          import json, os, urllib.request, urllib.error
+          from datetime import datetime
+
+          webhook = (os.environ.get("SHEETS_WEBHOOK_URL") or "").strip()
+          if not webhook:
+            raise SystemExit("Missing secret: SHEETS_WEBHOOK_URL")
+
+          # Read raw text so we can safely handle any trailing junk
+          raw = open("listings.json", "r", encoding="utf-8", errors="replace").read().lstrip()
+
+          # Parse ONLY the first JSON value (avoids JSONDecodeError: Extra data)
+          dec = json.JSONDecoder()
+          try:
+            data, _ = dec.raw_decode(raw)
+          except json.JSONDecodeError as e:
+            preview = raw[:200].replace("\n", "\\n")
+            raise SystemExit(f"Invalid JSON. First 200 chars: {preview}\nJSON error: {e}")
+
+          # listings.json is usually a list, keep dict fallback for safety
+          postings = []
+          if isinstance(data, list):
+            postings = data
+          elif isinstance(data, dict):
+            for v in data.values():
+              if isinstance(v, list):
+                postings.extend(v)
+          else:
+            raise SystemExit("Unexpected listings.json structure (not list or dict)")
+
+          def fmt_mmddyyyy(unix_seconds):
+            try:
+              return datetime.utcfromtimestamp(int(unix_seconds)).strftime("%m-%d-%Y")
+            except Exception:
+              return ""
+
+          jobs = []
+          for p in postings:
+            if not isinstance(p, dict):
+              continue
+
+            job_url = str(p.get("url") or "").strip()
+            if not job_url:
+              continue  # dedupe key
+
+            company = str(p.get("company_name") or "").strip()
+            role = str(p.get("title") or "").strip()
+
+            locs = p.get("locations")
+            if isinstance(locs, list):
+              location = "; ".join(str(x).strip() for x in locs if str(x).strip())
+            else:
+              location = str(locs or "").strip()
+
+            date_posted = fmt_mmddyyyy(p.get("date_posted"))
+
+            jobs.append({
+              "company": company,
+              "role": role,
+              "location": location,
+              "date_posted": date_posted,
+              "canonical_url": job_url
+            })
+
+          if not jobs:
+            print("No jobs parsed from listings.json (nothing to send).")
+            raise SystemExit(0)
+
+          payload = json.dumps({"jobs": jobs}).encode("utf-8")
+
+          req = urllib.request.Request(
+            webhook,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST"
+          )
+
+          try:
+            with urllib.request.urlopen(req, timeout=90) as resp:
+              body = resp.read().decode("utf-8", errors="replace")
+              print("Webhook response:", body)
+          except urllib.error.HTTPError as e:
+            err_body = e.read().decode("utf-8", errors="replace")
+            raise SystemExit(f"HTTP {e.code} posting to webhook: {err_body}")
+
+          print(f"Sent {len(jobs)} jobs to webhook.")
+          PY
